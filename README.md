@@ -18,6 +18,17 @@ go run upm_template_creator.go
 
 The app has following options:
 
-1. **Create a new package** — Copies the template (`UPM-Template` directory) into `<destination>/<package name>`, replaces name/author tokens (`UPM-Template`, `upm-token`, `UPMTemplate`, `Author`, etc.), optionally drops `Roadmap.md` and `Samples~` (and the `samples` block in `package.json` if samples are removed), and optionally regenerates all `.meta` GUIDs.
-2. **Edit an existing package** — Asks for the package folder path, bumps `version` in `package.json`, prepends a section to `CHANGELOG.md`, and optionally adds missing `.meta` files or regenerates all `.meta` GUIDs.
+1. Create a new plugin 
+
+- copies the template (`UPM-Template` directory) into specified destination, 
+- sets Author ,
+- optionally drops `Roadmap.md` and `Samples~`,
+- optionally regenerates all `.meta` GUIDs.
+
+2. Edit an existing plugin
+
+- asks for the package folder path, 
+- increases `version` in `package.json`, 
+- prepends a section to `CHANGELOG.md`, 
+- and optionally adds missing `.meta` files or regenerates all `.meta` GUIDs.
 
