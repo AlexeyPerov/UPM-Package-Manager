@@ -101,6 +101,7 @@ func createTemplate(reader *bufio.Reader, sourceTemplatePath string) {
 
 	includeRoadmap := promptYesNo(reader, "Include 'Roadmap.md'? (y/n) [y]: ", true)
 	includeSamples := promptYesNo(reader, "Include 'Samples~' folder? (y/n) [y]: ", true)
+	includeScreenshots := promptYesNo(reader, "Create 'Screenshots~' folder? (y/n) [y]: ", true)
 
 	if !includeRoadmap {
 		tryDeleteIfExists(filepath.Join(targetPath, "Roadmap.md"))
@@ -113,6 +114,15 @@ func createTemplate(reader *bufio.Reader, sourceTemplatePath string) {
 		if err := removeSamplesFromPackageJSON(filepath.Join(targetPath, "package.json")); err != nil {
 			fmt.Printf("Warning: failed to remove 'samples' from package.json: %v\n", err)
 		}
+	}
+
+	if includeScreenshots {
+		if err := os.MkdirAll(filepath.Join(targetPath, "Screenshots~"), 0o755); err != nil {
+			fmt.Printf("Warning: failed to create Screenshots~ folder: %v\n", err)
+		}
+	} else {
+		tryDeleteIfExists(filepath.Join(targetPath, "Screenshots~"))
+		tryDeleteIfExists(filepath.Join(targetPath, "Screenshots~.meta"))
 	}
 
 	if promptYesNo(reader, "Regenerate GUIDs in all .meta files? (y/n) [n]: ", false) {
@@ -423,6 +433,10 @@ func addMissingMetaFiles(rootPath string) (int, error) {
 			return nil
 		}
 
+		if shouldOmitMetaForAsset(rootClean, path, info) {
+			return nil
+		}
+
 		metaPath := path + ".meta"
 		if fileExists(metaPath) || dirExists(metaPath) {
 			return nil
@@ -442,6 +456,43 @@ func addMissingMetaFiles(rootPath string) (int, error) {
 		firstErr = err
 	}
 	return created, firstErr
+}
+
+// relPathHasTildeDir reports whether rel (relative to package root) passes through a directory
+// whose name ends with '~' (Unity optional-folder convention).
+func relPathHasTildeDir(rel string, isDir bool) bool {
+	rel = filepath.ToSlash(filepath.Clean(rel))
+	if rel == "." {
+		return false
+	}
+	parts := strings.Split(rel, "/")
+	limit := len(parts)
+	if !isDir && limit > 0 {
+		limit--
+	}
+	for i := 0; i < limit; i++ {
+		if strings.HasSuffix(parts[i], "~") {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldOmitMetaForAsset(rootClean, assetPath string, info os.FileInfo) bool {
+	if filepath.Clean(assetPath) == rootClean {
+		return false
+	}
+	rel, err := filepath.Rel(rootClean, filepath.Clean(assetPath))
+	if err != nil {
+		return false
+	}
+	if relPathHasTildeDir(rel, info.IsDir()) {
+		return true
+	}
+	if !info.IsDir() && strings.EqualFold(filepath.Base(assetPath), "LICENSE") {
+		return true
+	}
+	return false
 }
 
 func metaContentForPath(assetPath string, isDir bool) string {
@@ -543,6 +594,7 @@ func regenerateMetaGUIDs(rootPath string) (int, error) {
 	re := regexp.MustCompile(`(?m)^guid:\s*[0-9a-fA-F]+\s*$`)
 	updatedCount := 0
 	var firstErr error
+	rootClean := filepath.Clean(rootPath)
 
 	_ = filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -552,6 +604,15 @@ func regenerateMetaGUIDs(rootPath string) (int, error) {
 			return nil
 		}
 		if info.IsDir() || filepath.Ext(path) != ".meta" {
+			return nil
+		}
+
+		assetPath := strings.TrimSuffix(path, ".meta")
+		st, statErr := os.Stat(assetPath)
+		if statErr != nil {
+			return nil
+		}
+		if shouldOmitMetaForAsset(rootClean, assetPath, st) {
 			return nil
 		}
 
