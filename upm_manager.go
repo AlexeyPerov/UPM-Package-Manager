@@ -18,8 +18,8 @@ import (
 )
 
 const (
-	templateToken      = "UPM-Template"
-	maxRecentEditPaths = 10
+	templateToken    = "UPM-Template"
+	maxKnownPackages = 20
 )
 
 var packageNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]*$`)
@@ -88,9 +88,10 @@ func main() {
 		fmt.Println("1) Create a new package")
 		fmt.Println("2) Edit an existing package")
 		fmt.Println("3) Validate a package layout")
-		fmt.Println("4) Batch operations")
-		fmt.Println("5) Exit")
-		choice := promptNonEmpty(reader, "Please enter your choice (1-5): ")
+		fmt.Println("4) Scan for packages")
+		fmt.Println("5) Batch operations")
+		fmt.Println("6) Exit")
+		choice := promptNonEmpty(reader, "Please enter your choice (1-6): ")
 		fmt.Println()
 
 		switch strings.TrimSpace(choice) {
@@ -101,12 +102,14 @@ func main() {
 		case "3":
 			runValidatePackage(reader)
 		case "4":
-			runBatchOperations(reader)
+			scanPackagesOneLevel(reader)
 		case "5":
+			runBatchOperations(reader)
+		case "6":
 			fmt.Println("Exiting..")
 			return
 		default:
-			fmt.Println("Invalid option. Enter 1, 2, 3, 4, or 5.")
+			fmt.Println("Invalid option. Enter 1, 2, 3, 4, 5, or 6.")
 			fmt.Println()
 		}
 	}
@@ -214,16 +217,16 @@ func createTemplate(reader *bufio.Reader, sourceTemplatePath string) {
 		fmt.Printf("Regenerated GUIDs in %d .meta files.\n", updated)
 	}
 
-	if err := prependRecentEditPath(targetPath); err != nil {
-		fmt.Printf("Warning: could not save recent paths: %v\n", err)
+	if err := prependKnownPackagePath(targetPath); err != nil {
+		fmt.Printf("Warning: could not save known package paths: %v\n", err)
 	}
 
 	fmt.Printf("Created template: %s\n\n", targetPath)
 }
 
 func editTemplate(reader *bufio.Reader) {
-	recents := filterExistingRecentPaths(loadRecentEditPaths())
-	templatePath := promptEditPackagePath(reader, recents)
+	known := filterExistingKnownPaths(loadKnownPackagePaths())
+	templatePath := promptPackageFolderPath(reader, known)
 	fmt.Println()
 
 	if abs, err := filepath.Abs(filepath.Clean(templatePath)); err == nil {
@@ -291,8 +294,8 @@ func editTemplate(reader *bufio.Reader) {
 		fmt.Printf("Regenerated GUIDs in %d .meta files.\n", updatedCount)
 	}
 
-	if err := prependRecentEditPath(templatePath); err != nil {
-		fmt.Printf("Warning: could not save recent paths: %v\n", err)
+	if err := prependKnownPackagePath(templatePath); err != nil {
+		fmt.Printf("Warning: could not save known package paths: %v\n", err)
 	}
 
 	if newVersion != prevVersion {
@@ -304,8 +307,8 @@ func editTemplate(reader *bufio.Reader) {
 }
 
 func runValidatePackage(reader *bufio.Reader) {
-	recents := filterExistingRecentPaths(loadRecentEditPaths())
-	templatePath := promptEditPackagePath(reader, recents)
+	known := filterExistingKnownPaths(loadKnownPackagePaths())
+	templatePath := promptPackageFolderPath(reader, known)
 	fmt.Println()
 
 	if abs, err := filepath.Abs(filepath.Clean(templatePath)); err == nil {
@@ -338,23 +341,82 @@ func runValidatePackage(reader *bufio.Reader) {
 	}
 }
 
-func runBatchOperations(reader *bufio.Reader) {
-	recents := filterExistingRecentPaths(loadRecentEditPaths())
-	if len(recents) == 0 {
-		fmt.Println("No recent package folders saved yet.")
+func scanPackagesOneLevel(reader *bufio.Reader) {
+	root := strings.TrimSpace(promptNonEmpty(reader, "Enter folder to scan (immediate subfolders only): "))
+	root = filepath.Clean(root)
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		fmt.Printf("Invalid path: %v\n\n", err)
+		return
+	}
+	root = absRoot
+
+	if !dirExists(root) {
+		fmt.Println("Folder does not exist.")
 		fmt.Println()
 		return
 	}
 
-	fmt.Println("Recent package folders:")
-	for i, p := range recents {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		fmt.Printf("Cannot read folder: %v\n\n", err)
+		return
+	}
+
+	var found []string
+	for _, ent := range entries {
+		if !ent.IsDir() {
+			continue
+		}
+		name := ent.Name()
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		sub := filepath.Join(root, name)
+		if fileExists(filepath.Join(sub, "package.json")) {
+			if abs, err := filepath.Abs(sub); err == nil {
+				found = append(found, abs)
+			}
+		}
+	}
+	sort.Strings(found)
+	if len(found) == 0 {
+		fmt.Println("No packages found (no immediate subfolder contains package.json).")
+		fmt.Println()
+		return
+	}
+
+	fmt.Printf("Found %d package(s):\n", len(found))
+	for _, p := range found {
+		fmt.Printf("  %s\n", p)
+	}
+	fmt.Println()
+
+	if err := mergeKnownPackagesAtFront(found); err != nil {
+		fmt.Printf("Warning: could not save known packages: %v\n", err)
+	} else {
+		fmt.Println("Merged into known packages list (duplicates skipped).")
+	}
+	fmt.Println()
+}
+
+func runBatchOperations(reader *bufio.Reader) {
+	known := filterExistingKnownPaths(loadKnownPackagePaths())
+	if len(known) == 0 {
+		fmt.Println("No known package folders saved yet.")
+		fmt.Println()
+		return
+	}
+
+	fmt.Println("Known package folders:")
+	for i, p := range known {
 		fmt.Printf("  %d) %s\n", i+1, p)
 	}
 	fmt.Println()
 
-	fmt.Printf("Select indices (comma/space-separated), \"all\", or blank to cancel (1-%d): ", len(recents))
+	fmt.Printf("Select indices (comma/space-separated), \"all\", or blank to cancel (1-%d): ", len(known))
 	line, _ := reader.ReadString('\n')
-	indices, err := parseMultiSelect(strings.TrimSpace(line), len(recents))
+	indices, err := parseMultiSelect(strings.TrimSpace(line), len(known))
 	if err != nil {
 		fmt.Printf("Invalid selection: %v\n\n", err)
 		return
@@ -382,8 +444,8 @@ func runBatchOperations(reader *bufio.Reader) {
 	fmt.Println("Results:")
 	var summaries []string
 	for _, idx := range indices {
-		dir := recents[idx-1]
-		result := batchGitCommitPush(dir, msg)
+		dir := known[idx-1]
+		result := batchGitCommitPush(reader, dir, msg)
 		lineSummary := fmt.Sprintf("%s — %s", dir, result)
 		summaries = append(summaries, lineSummary)
 		fmt.Println(lineSummary)
@@ -513,25 +575,25 @@ func orphanMetaFindings(root string) []validationFinding {
 	return findings
 }
 
-// promptEditPackagePath lists recents with 1-based indices; user may enter a number, a path, or blank (default first recent).
-func promptEditPackagePath(reader *bufio.Reader, recents []string) string {
-	if len(recents) == 0 {
+// promptPackageFolderPath lists known paths with 1-based indices; user may enter a number, a path, or blank (default first known).
+func promptPackageFolderPath(reader *bufio.Reader, knownPackages []string) string {
+	if len(knownPackages) == 0 {
 		return promptNonEmpty(reader, "Enter existing template path: ")
 	}
-	fmt.Println("Recent package folders:")
-	for i, p := range recents {
+	fmt.Println("Known package folders:")
+	for i, p := range knownPackages {
 		fmt.Printf("  %d) %s\n", i+1, p)
 	}
 	fmt.Println()
-	prompt := fmt.Sprintf("Enter path, or number 1-%d (default: %s): ", len(recents), recents[0])
+	prompt := fmt.Sprintf("Enter path, or number 1-%d (default: %s): ", len(knownPackages), knownPackages[0])
 	fmt.Print(prompt)
 	text, _ := reader.ReadString('\n')
 	text = strings.TrimSpace(text)
 	if text == "" {
-		return recents[0]
+		return knownPackages[0]
 	}
-	if n, err := strconv.Atoi(text); err == nil && n >= 1 && n <= len(recents) {
-		return recents[n-1]
+	if n, err := strconv.Atoi(text); err == nil && n >= 1 && n <= len(knownPackages) {
+		return knownPackages[n-1]
 	}
 	return text
 }
@@ -738,7 +800,36 @@ func gitIsRepo(dir string) bool {
 	return cmd.Run() == nil
 }
 
-func batchGitCommitPush(dir, msg string) string {
+func gitChangedPaths(dir string) ([]string, error) {
+	cmds := [][]string{
+		{"git", "-C", dir, "diff", "--name-only"},
+		{"git", "-C", dir, "diff", "--cached", "--name-only"},
+		{"git", "-C", dir, "ls-files", "--others", "--exclude-standard"},
+	}
+	seen := make(map[string]struct{})
+	var names []string
+	for _, argv := range cmds {
+		out, err := exec.Command(argv[0], argv[1:]...).Output()
+		if err != nil {
+			return nil, err
+		}
+		for _, line := range strings.Split(string(out), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			if _, ok := seen[line]; ok {
+				continue
+			}
+			seen[line] = struct{}{}
+			names = append(names, line)
+		}
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+func batchGitCommitPush(reader *bufio.Reader, dir, msg string) string {
 	if !gitIsRepo(dir) {
 		return "skipped (not a git repository)"
 	}
@@ -749,6 +840,23 @@ func batchGitCommitPush(dir, msg string) string {
 	}
 	if len(bytes.TrimSpace(statusOut)) == 0 {
 		return "skipped (working tree clean)"
+	}
+
+	paths, err := gitChangedPaths(dir)
+	if err != nil {
+		return fmt.Sprintf("skipped (could not list changed files: %v)", err)
+	}
+	fmt.Printf("Changed/untracked files in %s:\n", dir)
+	if len(paths) == 0 {
+		fmt.Println("  (could not enumerate paths; git add -A will still stage everything)")
+	} else {
+		for _, p := range paths {
+			fmt.Printf("  %s\n", p)
+		}
+	}
+	fmt.Println()
+	if !promptYesNo(reader, "Proceed with commit and push for this repository? (y/n) [n]: ", false) {
+		return "skipped (cancelled by user)"
 	}
 
 	add := exec.Command("git", "-C", dir, "add", "-A")
@@ -896,7 +1004,37 @@ func tryReplaceInTextFile(path, oldValue, newValue string) {
 	_ = os.WriteFile(path, []byte(updated), 0o644)
 }
 
-func recentEditsFilePath() (string, error) {
+func migrateLegacyRecentEditsFile() {
+	newPath, err := knownPackagesFilePath()
+	if err != nil || fileExists(newPath) {
+		return
+	}
+	oldPath, err := legacyRecentEditsFilePath()
+	if err != nil || !fileExists(oldPath) {
+		return
+	}
+	data, err := os.ReadFile(oldPath)
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(newPath), 0o755); err != nil {
+		return
+	}
+	if err := os.WriteFile(newPath, data, 0o644); err != nil {
+		return
+	}
+	_ = os.Remove(oldPath)
+}
+
+func knownPackagesFilePath() (string, error) {
+	cfg, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(cfg, "upm-template-creator", "known-packages.txt"), nil
+}
+
+func legacyRecentEditsFilePath() (string, error) {
 	cfg, err := os.UserConfigDir()
 	if err != nil {
 		return "", err
@@ -904,11 +1042,7 @@ func recentEditsFilePath() (string, error) {
 	return filepath.Join(cfg, "upm-template-creator", "recent-edits.txt"), nil
 }
 
-func loadRecentEditPaths() []string {
-	path, err := recentEditsFilePath()
-	if err != nil {
-		return nil
-	}
+func loadKnownPackagePathsFromFile(path string) []string {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil
@@ -930,7 +1064,16 @@ func loadRecentEditPaths() []string {
 	return out
 }
 
-func filterExistingRecentPaths(paths []string) []string {
+func loadKnownPackagePaths() []string {
+	migrateLegacyRecentEditsFile()
+	path, err := knownPackagesFilePath()
+	if err != nil {
+		return nil
+	}
+	return loadKnownPackagePathsFromFile(path)
+}
+
+func filterExistingKnownPaths(paths []string) []string {
 	var out []string
 	for _, p := range paths {
 		if dirExists(p) {
@@ -940,33 +1083,48 @@ func filterExistingRecentPaths(paths []string) []string {
 	return out
 }
 
-func prependRecentEditPath(templatePath string) error {
-	absPath, err := filepath.Abs(filepath.Clean(templatePath))
+func mergeKnownPackagesAtFront(extra []string) error {
+	migrateLegacyRecentEditsFile()
+	filePath, err := knownPackagesFilePath()
 	if err != nil {
 		return err
 	}
-	filePath, err := recentEditsFilePath()
-	if err != nil {
-		return err
-	}
-	prev := loadRecentEditPaths()
+	prev := loadKnownPackagePathsFromFile(filePath)
+	seen := make(map[string]struct{})
 	var merged []string
-	merged = append(merged, absPath)
-	for _, p := range prev {
-		clean := filepath.Clean(p)
-		if clean == absPath || !dirExists(clean) {
-			continue
+
+	addAbs := func(p string) bool {
+		abs, err := filepath.Abs(filepath.Clean(p))
+		if err != nil || !dirExists(abs) {
+			return false
 		}
-		merged = append(merged, clean)
-		if len(merged) >= maxRecentEditPaths {
+		if _, ok := seen[abs]; ok {
+			return false
+		}
+		seen[abs] = struct{}{}
+		merged = append(merged, abs)
+		return true
+	}
+
+	for _, p := range extra {
+		addAbs(p)
+	}
+	for _, p := range prev {
+		if len(merged) >= maxKnownPackages {
 			break
 		}
+		addAbs(p)
 	}
+
 	dir := filepath.Dir(filePath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	return os.WriteFile(filePath, []byte(strings.Join(merged, "\n")), 0o644)
+}
+
+func prependKnownPackagePath(packageDir string) error {
+	return mergeKnownPackagesAtFront([]string{packageDir})
 }
 
 func prependChangelogVersion(changelogPath, version, label string) error {
