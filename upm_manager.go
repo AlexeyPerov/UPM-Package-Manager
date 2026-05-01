@@ -4,16 +4,46 @@ import (
 	"bufio"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
-const templateToken = "UPM-Template"
+const (
+	templateToken        = "UPM-Template"
+	maxRecentEditPaths   = 10
+	packageJSONVersionRe = `"version"\s*:\s*"([^"]*)"`
+)
+
+var (
+	packageVersionPattern = regexp.MustCompile(packageJSONVersionRe)
+	packageNamePattern    = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]*$`)
+)
+
+type validationSeverity int
+
+const (
+	severityError validationSeverity = iota
+	severityWarn
+)
+
+type validationFinding struct {
+	severity validationSeverity
+	message  string
+}
+
+type packageManifestForValidate struct {
+	Name    string `json:"name"`
+	Samples []struct {
+		Path string `json:"path"`
+	} `json:"samples"`
+}
 
 func main() {
 	reader := bufio.NewReader(os.Stdin)
@@ -31,8 +61,9 @@ func main() {
 		fmt.Println("Select an option:")
 		fmt.Println("1) Create a new package")
 		fmt.Println("2) Edit an existing package")
-		fmt.Println("3) Exit")
-		choice := promptNonEmpty(reader, "Please enter your choice (1-3): ")
+		fmt.Println("3) Validate a package layout")
+		fmt.Println("4) Exit")
+		choice := promptNonEmpty(reader, "Please enter your choice (1-4): ")
 		fmt.Println()
 
 		switch strings.TrimSpace(choice) {
@@ -41,10 +72,12 @@ func main() {
 		case "2":
 			editTemplate(reader)
 		case "3":
+			runValidatePackage(reader)
+		case "4":
 			fmt.Println("Exiting..")
 			return
 		default:
-			fmt.Println("Invalid option. Enter 1, 2, or 3.")
+			fmt.Println("Invalid option. Enter 1, 2, 3, or 4.")
 			fmt.Println()
 		}
 	}
@@ -137,7 +170,14 @@ func createTemplate(reader *bufio.Reader, sourceTemplatePath string) {
 }
 
 func editTemplate(reader *bufio.Reader) {
-	templatePath := promptNonEmpty(reader, "Enter existing template path: ")
+	recents := filterExistingRecentPaths(loadRecentEditPaths())
+	templatePath := promptEditPackagePath(reader, recents)
+	fmt.Println()
+
+	if abs, err := filepath.Abs(filepath.Clean(templatePath)); err == nil {
+		templatePath = abs
+	}
+
 	if !dirExists(templatePath) {
 		fmt.Println("Path does not exist.")
 		fmt.Println()
@@ -156,17 +196,26 @@ func editTemplate(reader *bufio.Reader) {
 		return
 	}
 
-	newVersion := promptNonEmpty(reader, "Enter new version for package.json (e.g. 1.0.1): ")
-	defaultLabel := time.Now().UTC().Format("2006-01-02")
-	label := promptAllowEmpty(reader, fmt.Sprintf("Enter changelog label after '-' (default: %s): ", defaultLabel), defaultLabel)
-
-	if err := updatePackageJSONVersion(packageJSONPath, newVersion); err != nil {
-		fmt.Printf("Failed to update package.json version: %v\n\n", err)
-		return
+	currentVer, err := readPackageJSONVersion(packageJSONPath)
+	if err != nil {
+		fmt.Printf("Warning: could not read current version: %v\n\n", err)
+	} else {
+		fmt.Printf("Current package version: %s\n\n", currentVer)
 	}
-	if err := prependChangelogVersion(changelogPath, newVersion, label); err != nil {
-		fmt.Printf("Failed to update changelog: %v\n\n", err)
-		return
+
+	newVersion := promptAllowEmpty(reader, "Enter new version for package.json (e.g. 1.0.1, Enter to keep current): ", "")
+	if newVersion != "" {
+		defaultLabel := time.Now().UTC().Format("2006-01-02")
+		label := promptAllowEmpty(reader, fmt.Sprintf("Enter changelog label after '-' (default: %s): ", defaultLabel), defaultLabel)
+
+		if err := updatePackageJSONVersion(packageJSONPath, newVersion); err != nil {
+			fmt.Printf("Failed to update package.json version: %v\n\n", err)
+			return
+		}
+		if err := prependChangelogVersion(changelogPath, newVersion, label); err != nil {
+			fmt.Printf("Failed to update changelog: %v\n\n", err)
+			return
+		}
 	}
 
 	if promptYesNo(reader, "Add missing .meta files (new files get random GUIDs)? (y/n) [n]: ", false) {
@@ -185,8 +234,191 @@ func editTemplate(reader *bufio.Reader) {
 		fmt.Printf("Regenerated GUIDs in %d .meta files.\n", updated)
 	}
 
-	fmt.Println("Template updated (version + changelog).")
+	if err := prependRecentEditPath(templatePath); err != nil {
+		fmt.Printf("Warning: could not save recent paths: %v\n", err)
+	}
+
+	if newVersion != "" {
+		fmt.Println("Template updated (version + changelog).")
+	} else {
+		fmt.Println("Edit finished (version and changelog unchanged).")
+	}
 	fmt.Println()
+}
+
+func runValidatePackage(reader *bufio.Reader) {
+	recents := filterExistingRecentPaths(loadRecentEditPaths())
+	templatePath := promptEditPackagePath(reader, recents)
+	fmt.Println()
+
+	if abs, err := filepath.Abs(filepath.Clean(templatePath)); err == nil {
+		templatePath = abs
+	}
+
+	if !dirExists(templatePath) {
+		fmt.Println("Path does not exist.")
+		fmt.Println()
+		return
+	}
+
+	findings := validatePackageLayout(templatePath)
+	errCount, warnCount := 0, 0
+	for _, f := range findings {
+		switch f.severity {
+		case severityError:
+			fmt.Printf("ERROR: %s\n", f.message)
+			errCount++
+		case severityWarn:
+			fmt.Printf("WARN: %s\n", f.message)
+			warnCount++
+		}
+	}
+	fmt.Printf("\nSummary: %d error(s), %d warning(s)\n", errCount, warnCount)
+	fmt.Println()
+
+	if errCount > 0 {
+		os.Exit(1)
+	}
+}
+
+func validatePackageLayout(root string) []validationFinding {
+	var findings []validationFinding
+	rootClean := filepath.Clean(root)
+	packageJSONPath := filepath.Join(rootClean, "package.json")
+
+	if !fileExists(packageJSONPath) {
+		findings = append(findings, validationFinding{
+			severityError,
+			fmt.Sprintf("package.json not found at %s", packageJSONPath),
+		})
+		return findings
+	}
+
+	data, err := os.ReadFile(packageJSONPath)
+	if err != nil {
+		findings = append(findings, validationFinding{
+			severityError,
+			fmt.Sprintf("cannot read package.json: %v", err),
+		})
+		return findings
+	}
+
+	var manifest packageManifestForValidate
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		findings = append(findings, validationFinding{
+			severityError,
+			fmt.Sprintf("package.json is not valid JSON: %v", err),
+		})
+		return findings
+	}
+
+	name := strings.TrimSpace(manifest.Name)
+	if name == "" {
+		findings = append(findings, validationFinding{
+			severityError,
+			`'name' in package.json is missing or empty`,
+		})
+	} else if !packageNamePattern.MatchString(name) {
+		findings = append(findings, validationFinding{
+			severityError,
+			fmt.Sprintf(`package.json 'name' must match lowercase DNS-like pattern ^[a-z0-9][a-z0-9.-]*$ (got %q)`, name),
+		})
+	} else {
+		folderBase := filepath.Base(rootClean)
+		lastSeg := packageNameLastSegment(name)
+		if !strings.EqualFold(folderBase, name) && !strings.EqualFold(folderBase, lastSeg) {
+			findings = append(findings, validationFinding{
+				severityWarn,
+				fmt.Sprintf("folder name %q does not match package name %q (expected folder %q or %q, case-insensitive)", folderBase, name, lastSeg, name),
+			})
+		}
+	}
+
+	changelogPath := filepath.Join(rootClean, "CHANGELOG.md")
+	if !fileExists(changelogPath) {
+		findings = append(findings, validationFinding{
+			severityWarn,
+			fmt.Sprintf("CHANGELOG.md not found at %s", changelogPath),
+		})
+	}
+
+	for i, sample := range manifest.Samples {
+		p := strings.TrimSpace(sample.Path)
+		if p == "" {
+			findings = append(findings, validationFinding{
+				severityWarn,
+				fmt.Sprintf(`samples[%d] has missing or empty "path"`, i),
+			})
+			continue
+		}
+		full := filepath.Join(rootClean, filepath.FromSlash(p))
+		if !dirExists(full) && !fileExists(full) {
+			findings = append(findings, validationFinding{
+				severityWarn,
+				fmt.Sprintf(`samples[%d] path does not exist on disk: %s`, i, full),
+			})
+		}
+	}
+
+	findings = append(findings, orphanMetaFindings(rootClean)...)
+
+	return findings
+}
+
+func packageNameLastSegment(name string) string {
+	name = strings.TrimSpace(name)
+	if i := strings.LastIndex(name, "."); i >= 0 && i < len(name)-1 {
+		return name[i+1:]
+	}
+	return name
+}
+
+func orphanMetaFindings(root string) []validationFinding {
+	var findings []validationFinding
+	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		base := filepath.Base(path)
+		if info.IsDir() && strings.HasPrefix(base, ".") {
+			return filepath.SkipDir
+		}
+		if info.IsDir() || !strings.HasSuffix(strings.ToLower(path), ".meta") {
+			return nil
+		}
+		assetPath := strings.TrimSuffix(path, ".meta")
+		if _, statErr := os.Stat(assetPath); statErr != nil {
+			findings = append(findings, validationFinding{
+				severityWarn,
+				fmt.Sprintf("orphan .meta (asset missing): %s", path),
+			})
+		}
+		return nil
+	})
+	return findings
+}
+
+// promptEditPackagePath lists recents with 1-based indices; user may enter a number, a path, or blank (default first recent).
+func promptEditPackagePath(reader *bufio.Reader, recents []string) string {
+	if len(recents) == 0 {
+		return promptNonEmpty(reader, "Enter existing template path: ")
+	}
+	fmt.Println("Recent package folders:")
+	for i, p := range recents {
+		fmt.Printf("  %d) %s\n", i+1, p)
+	}
+	fmt.Println()
+	prompt := fmt.Sprintf("Enter path, or number 1-%d (default: %s): ", len(recents), recents[0])
+	fmt.Print(prompt)
+	text, _ := reader.ReadString('\n')
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return recents[0]
+	}
+	if n, err := strconv.Atoi(text); err == nil && n >= 1 && n <= len(recents) {
+		return recents[n-1]
+	}
+	return text
 }
 
 func promptNonEmpty(reader *bufio.Reader, prompt string) string {
@@ -347,6 +579,91 @@ func tryReplaceInTextFile(path, oldValue, newValue string) {
 	_ = os.WriteFile(path, []byte(updated), 0o644)
 }
 
+func readPackageJSONVersion(packageJSONPath string) (string, error) {
+	data, err := os.ReadFile(packageJSONPath)
+	if err != nil {
+		return "", err
+	}
+	m := packageVersionPattern.FindStringSubmatch(string(data))
+	if len(m) < 2 {
+		return "", fmt.Errorf("could not find 'version' key")
+	}
+	return m[1], nil
+}
+
+func recentEditsFilePath() (string, error) {
+	cfg, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(cfg, "upm-template-creator", "recent-edits.txt"), nil
+}
+
+func loadRecentEditPaths() []string {
+	path, err := recentEditsFilePath()
+	if err != nil {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	seen := make(map[string]struct{})
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		clean := filepath.Clean(line)
+		if _, ok := seen[clean]; ok {
+			continue
+		}
+		seen[clean] = struct{}{}
+		out = append(out, clean)
+	}
+	return out
+}
+
+func filterExistingRecentPaths(paths []string) []string {
+	var out []string
+	for _, p := range paths {
+		if dirExists(p) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func prependRecentEditPath(templatePath string) error {
+	absPath, err := filepath.Abs(filepath.Clean(templatePath))
+	if err != nil {
+		return err
+	}
+	filePath, err := recentEditsFilePath()
+	if err != nil {
+		return err
+	}
+	prev := loadRecentEditPaths()
+	var merged []string
+	merged = append(merged, absPath)
+	for _, p := range prev {
+		clean := filepath.Clean(p)
+		if clean == absPath || !dirExists(clean) {
+			continue
+		}
+		merged = append(merged, clean)
+		if len(merged) >= maxRecentEditPaths {
+			break
+		}
+	}
+	dir := filepath.Dir(filePath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(filePath, []byte(strings.Join(merged, "\n")), 0o644)
+}
+
 func updatePackageJSONVersion(packageJSONPath, newVersion string) error {
 	data, err := os.ReadFile(packageJSONPath)
 	if err != nil {
@@ -487,9 +804,6 @@ func shouldOmitMetaForAsset(rootClean, assetPath string, info os.FileInfo) bool 
 		return false
 	}
 	if relPathHasTildeDir(rel, info.IsDir()) {
-		return true
-	}
-	if !info.IsDir() && strings.EqualFold(filepath.Base(assetPath), "LICENSE") {
 		return true
 	}
 	return false
