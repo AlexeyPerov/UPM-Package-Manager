@@ -1,10 +1,11 @@
 # UPM Package Manager
 
-Simple console app to create and/or edit a Unity Package Manager plugin template. Here you can create a new package, edit existing one, validate layout, maintain versions and guids in `.meta` files.
+Simple console app to create and/or edit a Unity Package Manager plugin template: full `package.json` prompts matching the bundled template shape, validation, `.meta` maintenance, recent-folder shortcuts, and optional batch git actions.
 
 ## Requirements
 
 - [Go](https://go.dev/) 1.18+
+- **Batch commit/push**: `git` on `PATH`; each selected folder must be a git repo with a configured remote for `git push`.
 
 ## Run
 
@@ -16,30 +17,32 @@ go run upm_manager.go
 
 ## Usage
 
-The app has following options:
+The app has these options:
 
-1. Create a new plugin 
+1. **Create a new package**
 
-- copies the template (`UPM-Template` directory) into specified destination, 
-- sets Author ,
-- optionally drops `Roadmap.md`, `Samples~` and `Screenshots~`
-- optionally regenerates all `.meta` GUIDs.
+- Loads defaults from the template’s `package.json`, then asks for **Roadmap.md**, **Samples~**, and **Screenshots~** (yes/no).
+- Prompts all manifest fields (Enter keeps the default shown): `name`, `version`, `displayName`, `description`, `unity`, `keywords` (comma-separated), `author.name`, `author.url`, and **samples** (`displayName`, `description`, `path` per entry) **only when Samples~ is included**.
+- Copies `UPM-Template`, applies token replacements for README/asmdef/etc., drops optional folders, writes **`package.json`** from your answers, optionally regenerates `.meta` GUIDs.
+- Adds the new package path to the **recent folders** list.
 
-2. Edit an existing plugin
+2. **Edit an existing package**
 
-- asks for the package folder path, 
-- increases `version` in `package.json`, 
-- prepends a section to `CHANGELOG.md`, 
-- and optionally adds missing `.meta` files or regenerates all `.meta` GUIDs.
+- Chooses the package folder (recent-folder shortcuts supported).
+- Prompts the same **`package.json`** fields from current values (Enter keeps current).
+- If **`version`** changes, asks for the changelog date label and prepends **`CHANGELOG.md`** (same layout as before).
+- Optionally adds missing `.meta` files or regenerates GUIDs.
+- Updates **recent folders**.
 
-3. Validate a package layout
+3. **Validate a package layout**
 
-- asks for the package folder path (same recent-folder shortcuts as Edit),
-- reports **ERROR** issues (missing `package.json`, unreadable file, invalid JSON, missing or invalid `name` per Unity-style lowercase DNS-like pattern `^[a-z0-9][a-z0-9.-]*$`),
-- reports **WARN** issues when applicable:
-  - folder name does not match the package `name` (expects the root folder to match either the full `name` or its last dotted segment, case-insensitive),
-  - `CHANGELOG.md` is missing,
-  - each `samples[]` entry has a non-empty `path` that exists under the package root,
-  - orphan `.meta` files (`.meta` present without the corresponding asset folder/file).
+- Chooses the package folder (same shortcuts as Edit).
+- Reports **ERROR** / **WARN** issues (`package.json`, `name` pattern, folder vs name, `CHANGELOG.md`, `samples` paths, orphan `.meta`).
+- Exits with status **1** if any ERROR; warnings-only exits **0**.
 
-After validation finishes, the process exits with status **1** if there was at least one ERROR; warnings alone exit with **0**.
+4. **Batch operations**
+
+- Shows **recent** package folders; select indices separated by commas or spaces (e.g. `1,3`), **`all`**, or blank to cancel.
+- **Commit and push changes**: asks for a **commit message**, then for each repo runs `git add -A`, `git commit -m ...`, and `git push`. Skips folders that are not git repos, have a clean tree, or have nothing to commit; prints one status line per folder and a short summary.
+
+5. **Exit**

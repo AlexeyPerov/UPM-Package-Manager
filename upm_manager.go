@@ -2,11 +2,13 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -16,15 +18,11 @@ import (
 )
 
 const (
-	templateToken        = "UPM-Template"
-	maxRecentEditPaths   = 10
-	packageJSONVersionRe = `"version"\s*:\s*"([^"]*)"`
+	templateToken      = "UPM-Template"
+	maxRecentEditPaths = 10
 )
 
-var (
-	packageVersionPattern = regexp.MustCompile(packageJSONVersionRe)
-	packageNamePattern    = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]*$`)
-)
+var packageNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]*$`)
 
 type validationSeverity int
 
@@ -45,6 +43,34 @@ type packageManifestForValidate struct {
 	} `json:"samples"`
 }
 
+// PackageManifest matches Unity manifest shape used by UPM-Template/package.json.
+type PackageManifest struct {
+	Name        string           `json:"name"`
+	Version     string           `json:"version"`
+	DisplayName string           `json:"displayName"`
+	Description string           `json:"description"`
+	Unity       string           `json:"unity"`
+	Keywords    []string         `json:"keywords"`
+	Author      manifestAuthor   `json:"author"`
+	Samples     []manifestSample `json:"samples,omitempty"`
+}
+
+type manifestAuthor struct {
+	Name string `json:"name"`
+	URL  string `json:"url"`
+}
+
+type manifestSample struct {
+	DisplayName string `json:"displayName"`
+	Description string `json:"description"`
+	Path        string `json:"path"`
+}
+
+type manifestPromptOpts struct {
+	create         bool
+	includeSamples bool
+}
+
 func main() {
 	reader := bufio.NewReader(os.Stdin)
 	defaultTemplatePath := resolveTemplatePath()
@@ -62,8 +88,9 @@ func main() {
 		fmt.Println("1) Create a new package")
 		fmt.Println("2) Edit an existing package")
 		fmt.Println("3) Validate a package layout")
-		fmt.Println("4) Exit")
-		choice := promptNonEmpty(reader, "Please enter your choice (1-4): ")
+		fmt.Println("4) Batch operations")
+		fmt.Println("5) Exit")
+		choice := promptNonEmpty(reader, "Please enter your choice (1-5): ")
 		fmt.Println()
 
 		switch strings.TrimSpace(choice) {
@@ -74,10 +101,12 @@ func main() {
 		case "3":
 			runValidatePackage(reader)
 		case "4":
+			runBatchOperations(reader)
+		case "5":
 			fmt.Println("Exiting..")
 			return
 		default:
-			fmt.Println("Invalid option. Enter 1, 2, 3, or 4.")
+			fmt.Println("Invalid option. Enter 1, 2, 3, 4, or 5.")
 			fmt.Println()
 		}
 	}
@@ -102,7 +131,14 @@ func createTemplate(reader *bufio.Reader, sourceTemplatePath string) {
 	suggestedDestination := getSuggestedDestinationFolder(resolvedSource)
 	fmt.Printf("Using template folder: %s\n\n", resolvedSource)
 
-	pluginName := promptNonEmpty(reader, "Enter new package name: ")
+	templatePackageJSON := filepath.Join(resolvedSource, "package.json")
+	defaultManifest, err := readPackageManifest(templatePackageJSON)
+	if err != nil {
+		fmt.Printf("Cannot read template package.json (%s): %v\n\n", templatePackageJSON, err)
+		return
+	}
+
+	pluginName := promptNonEmpty(reader, "Enter new package name (folder name): ")
 	outputParent := promptAllowEmpty(
 		reader,
 		fmt.Sprintf("Enter destination folder (the app will create a sub-folder named as the new template there, with name '%s') (default: %s): ", pluginName, suggestedDestination),
@@ -121,20 +157,29 @@ func createTemplate(reader *bufio.Reader, sourceTemplatePath string) {
 		return
 	}
 
-	authorName := promptNonEmpty(reader, "Enter author name (replaces 'Author' in package.json and LICENSE): ")
+	includeRoadmap := promptYesNo(reader, "Include 'Roadmap.md'? (y/n) [y]: ", true)
+	includeSamples := promptYesNo(reader, "Include 'Samples~' folder? (y/n) [y]: ", true)
+	includeScreenshots := promptYesNo(reader, "Create 'Screenshots~' folder? (y/n) [y]: ", true)
+
+	fmt.Println()
+	fmt.Println("package.json fields (defaults from template; Enter keeps default):")
+	manifest := promptPackageManifest(reader, defaultManifest, manifestPromptOpts{
+		create:         true,
+		includeSamples: includeSamples,
+	})
+	if !includeSamples {
+		manifest.Samples = nil
+	}
+	fmt.Println()
 
 	if err := copyDirectory(resolvedSource, targetPath); err != nil {
 		fmt.Printf("Failed to copy template: %v\n\n", err)
 		return
 	}
-	if err := applyTemplateTokenReplacements(targetPath, templateToken, pluginName, authorName, ""); err != nil {
+	if err := applyTemplateTokenReplacements(targetPath, templateToken, pluginName, manifest.Author.Name, ""); err != nil {
 		fmt.Printf("Failed to apply replacements: %v\n\n", err)
 		return
 	}
-
-	includeRoadmap := promptYesNo(reader, "Include 'Roadmap.md'? (y/n) [y]: ", true)
-	includeSamples := promptYesNo(reader, "Include 'Samples~' folder? (y/n) [y]: ", true)
-	includeScreenshots := promptYesNo(reader, "Create 'Screenshots~' folder? (y/n) [y]: ", true)
 
 	if !includeRoadmap {
 		tryDeleteIfExists(filepath.Join(targetPath, "Roadmap.md"))
@@ -144,9 +189,6 @@ func createTemplate(reader *bufio.Reader, sourceTemplatePath string) {
 	if !includeSamples {
 		tryDeleteIfExists(filepath.Join(targetPath, "Samples~"))
 		tryDeleteIfExists(filepath.Join(targetPath, "Samples~.meta"))
-		if err := removeSamplesFromPackageJSON(filepath.Join(targetPath, "package.json")); err != nil {
-			fmt.Printf("Warning: failed to remove 'samples' from package.json: %v\n", err)
-		}
 	}
 
 	if includeScreenshots {
@@ -158,12 +200,22 @@ func createTemplate(reader *bufio.Reader, sourceTemplatePath string) {
 		tryDeleteIfExists(filepath.Join(targetPath, "Screenshots~.meta"))
 	}
 
+	packageJSONPath := filepath.Join(targetPath, "package.json")
+	if err := writePackageManifest(packageJSONPath, manifest); err != nil {
+		fmt.Printf("Failed to write package.json: %v\n\n", err)
+		return
+	}
+
 	if promptYesNo(reader, "Regenerate GUIDs in all .meta files? (y/n) [n]: ", false) {
 		updated, err := regenerateMetaGUIDs(targetPath)
 		if err != nil {
 			fmt.Printf("Warning: GUID regeneration completed with errors: %v\n", err)
 		}
 		fmt.Printf("Regenerated GUIDs in %d .meta files.\n", updated)
+	}
+
+	if err := prependRecentEditPath(targetPath); err != nil {
+		fmt.Printf("Warning: could not save recent paths: %v\n", err)
 	}
 
 	fmt.Printf("Created template: %s\n\n", targetPath)
@@ -196,22 +248,27 @@ func editTemplate(reader *bufio.Reader) {
 		return
 	}
 
-	currentVer, err := readPackageJSONVersion(packageJSONPath)
+	manifest, err := readPackageManifest(packageJSONPath)
 	if err != nil {
-		fmt.Printf("Warning: could not read current version: %v\n\n", err)
-	} else {
-		fmt.Printf("Current package version: %s\n\n", currentVer)
+		fmt.Printf("Failed to read package.json: %v\n\n", err)
+		return
 	}
 
-	newVersion := promptAllowEmpty(reader, "Enter new version for package.json (e.g. 1.0.1, Enter to keep current): ", "")
-	if newVersion != "" {
+	prevVersion := strings.TrimSpace(manifest.Version)
+
+	fmt.Println("package.json fields (Enter keeps current value):")
+	updated := promptPackageManifest(reader, manifest, manifestPromptOpts{create: false})
+	fmt.Println()
+
+	if err := writePackageManifest(packageJSONPath, updated); err != nil {
+		fmt.Printf("Failed to write package.json: %v\n\n", err)
+		return
+	}
+
+	newVersion := strings.TrimSpace(updated.Version)
+	if newVersion != prevVersion {
 		defaultLabel := time.Now().UTC().Format("2006-01-02")
 		label := promptAllowEmpty(reader, fmt.Sprintf("Enter changelog label after '-' (default: %s): ", defaultLabel), defaultLabel)
-
-		if err := updatePackageJSONVersion(packageJSONPath, newVersion); err != nil {
-			fmt.Printf("Failed to update package.json version: %v\n\n", err)
-			return
-		}
 		if err := prependChangelogVersion(changelogPath, newVersion, label); err != nil {
 			fmt.Printf("Failed to update changelog: %v\n\n", err)
 			return
@@ -227,21 +284,21 @@ func editTemplate(reader *bufio.Reader) {
 	}
 
 	if promptYesNo(reader, "Regenerate GUIDs in all .meta files? (y/n) [n]: ", false) {
-		updated, err := regenerateMetaGUIDs(templatePath)
+		updatedCount, err := regenerateMetaGUIDs(templatePath)
 		if err != nil {
 			fmt.Printf("Warning: GUID regeneration completed with errors: %v\n", err)
 		}
-		fmt.Printf("Regenerated GUIDs in %d .meta files.\n", updated)
+		fmt.Printf("Regenerated GUIDs in %d .meta files.\n", updatedCount)
 	}
 
 	if err := prependRecentEditPath(templatePath); err != nil {
 		fmt.Printf("Warning: could not save recent paths: %v\n", err)
 	}
 
-	if newVersion != "" {
-		fmt.Println("Template updated (version + changelog).")
+	if newVersion != prevVersion {
+		fmt.Println("Template updated (package.json + changelog).")
 	} else {
-		fmt.Println("Edit finished (version and changelog unchanged).")
+		fmt.Println("Edit finished (package.json saved; version and changelog unchanged).")
 	}
 	fmt.Println()
 }
@@ -279,6 +336,64 @@ func runValidatePackage(reader *bufio.Reader) {
 	if errCount > 0 {
 		os.Exit(1)
 	}
+}
+
+func runBatchOperations(reader *bufio.Reader) {
+	recents := filterExistingRecentPaths(loadRecentEditPaths())
+	if len(recents) == 0 {
+		fmt.Println("No recent package folders saved yet.")
+		fmt.Println()
+		return
+	}
+
+	fmt.Println("Recent package folders:")
+	for i, p := range recents {
+		fmt.Printf("  %d) %s\n", i+1, p)
+	}
+	fmt.Println()
+
+	fmt.Printf("Select indices (comma/space-separated), \"all\", or blank to cancel (1-%d): ", len(recents))
+	line, _ := reader.ReadString('\n')
+	indices, err := parseMultiSelect(strings.TrimSpace(line), len(recents))
+	if err != nil {
+		fmt.Printf("Invalid selection: %v\n\n", err)
+		return
+	}
+	if len(indices) == 0 {
+		fmt.Println("Cancelled (no packages selected).")
+		fmt.Println()
+		return
+	}
+
+	fmt.Println()
+	fmt.Println("Batch action:")
+	fmt.Println("1) Commit and push changes")
+	fmt.Println("2) Cancel")
+	action := strings.TrimSpace(promptAllowEmpty(reader, "Choice (1-2, default 2): ", "2"))
+	if action != "1" {
+		fmt.Println("Cancelled.")
+		fmt.Println()
+		return
+	}
+
+	msg := promptNonEmpty(reader, "Commit message: ")
+	fmt.Println()
+
+	fmt.Println("Results:")
+	var summaries []string
+	for _, idx := range indices {
+		dir := recents[idx-1]
+		result := batchGitCommitPush(dir, msg)
+		lineSummary := fmt.Sprintf("%s — %s", dir, result)
+		summaries = append(summaries, lineSummary)
+		fmt.Println(lineSummary)
+	}
+	fmt.Println()
+	fmt.Println("Batch summary:")
+	for _, s := range summaries {
+		fmt.Println(" ", s)
+	}
+	fmt.Println()
 }
 
 func validatePackageLayout(root string) []validationFinding {
@@ -461,6 +576,208 @@ func promptYesNo(reader *bufio.Reader, prompt string, defaultYes bool) bool {
 	}
 }
 
+func clonePackageManifest(m *PackageManifest) PackageManifest {
+	if m == nil {
+		return PackageManifest{}
+	}
+	out := *m
+	out.Keywords = append([]string(nil), m.Keywords...)
+	out.Samples = append([]manifestSample(nil), m.Samples...)
+	return out
+}
+
+func readPackageManifest(path string) (*PackageManifest, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var m PackageManifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+func writePackageManifest(path string, m *PackageManifest) error {
+	toWrite := clonePackageManifest(m)
+	if toWrite.Keywords == nil {
+		toWrite.Keywords = []string{}
+	}
+	data, err := json.MarshalIndent(toWrite, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return os.WriteFile(path, data, 0o644)
+}
+
+func keywordsEditString(k []string) string {
+	return strings.Join(k, ", ")
+}
+
+func parseKeywords(line string) []string {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return nil
+	}
+	parts := strings.Split(line, ",")
+	var out []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func promptPackageManifest(reader *bufio.Reader, defaults *PackageManifest, opts manifestPromptOpts) *PackageManifest {
+	cloned := clonePackageManifest(defaults)
+	out := &cloned
+
+	for {
+		def := out.Name
+		name := strings.TrimSpace(promptAllowEmpty(reader, fmt.Sprintf("name [%s]: ", def), def))
+		if opts.create && name == "" {
+			fmt.Println("Name cannot be empty.")
+			continue
+		}
+		out.Name = name
+		if out.Name != "" && !packageNamePattern.MatchString(out.Name) {
+			fmt.Printf("Invalid package name %q (expected pattern ^[a-z0-9][a-z0-9.-]*$).\n", out.Name)
+			continue
+		}
+		break
+	}
+
+	def := strings.TrimSpace(out.Version)
+	out.Version = strings.TrimSpace(promptAllowEmpty(reader, fmt.Sprintf("version [%s]: ", def), def))
+
+	def = out.DisplayName
+	out.DisplayName = strings.TrimSpace(promptAllowEmpty(reader, fmt.Sprintf("displayName [%s]: ", def), def))
+
+	def = out.Description
+	out.Description = strings.TrimSpace(promptAllowEmpty(reader, fmt.Sprintf("description [%s]: ", def), def))
+
+	def = out.Unity
+	out.Unity = strings.TrimSpace(promptAllowEmpty(reader, fmt.Sprintf("unity [%s]: ", def), def))
+
+	kwDef := keywordsEditString(out.Keywords)
+	kwLine := strings.TrimSpace(promptAllowEmpty(reader, fmt.Sprintf("keywords (comma-separated) [%s]: ", kwDef), kwDef))
+	out.Keywords = parseKeywords(kwLine)
+
+	def = out.Author.Name
+	out.Author.Name = strings.TrimSpace(promptAllowEmpty(reader, fmt.Sprintf("author.name [%s]: ", def), def))
+
+	def = out.Author.URL
+	out.Author.URL = strings.TrimSpace(promptAllowEmpty(reader, fmt.Sprintf("author.url [%s]: ", def), def))
+
+	promptSamples := false
+	if opts.create && opts.includeSamples {
+		promptSamples = true
+		if len(out.Samples) == 0 {
+			out.Samples = []manifestSample{{}}
+		}
+	} else if !opts.create && len(out.Samples) > 0 {
+		promptSamples = true
+	}
+
+	if promptSamples {
+		for i := range out.Samples {
+			fmt.Printf("samples[%d]\n", i)
+			s := &out.Samples[i]
+			def = s.DisplayName
+			s.DisplayName = strings.TrimSpace(promptAllowEmpty(reader, fmt.Sprintf("  displayName [%s]: ", def), def))
+			def = s.Description
+			s.Description = strings.TrimSpace(promptAllowEmpty(reader, fmt.Sprintf("  description [%s]: ", def), def))
+			def = s.Path
+			s.Path = strings.TrimSpace(promptAllowEmpty(reader, fmt.Sprintf("  path [%s]: ", def), def))
+		}
+	}
+
+	return out
+}
+
+func parseMultiSelect(line string, max int) ([]int, error) {
+	line = strings.TrimSpace(strings.ToLower(line))
+	if line == "" {
+		return nil, nil
+	}
+	if line == "all" {
+		out := make([]int, max)
+		for i := range out {
+			out[i] = i + 1
+		}
+		return out, nil
+	}
+	line = strings.ReplaceAll(line, ",", " ")
+	fields := strings.Fields(line)
+	seen := make(map[int]struct{})
+	var nums []int
+	for _, f := range fields {
+		n, err := strconv.Atoi(f)
+		if err != nil {
+			return nil, fmt.Errorf("invalid token %q", f)
+		}
+		if n < 1 || n > max {
+			return nil, fmt.Errorf("index %d out of range (1-%d)", n, max)
+		}
+		if _, ok := seen[n]; ok {
+			continue
+		}
+		seen[n] = struct{}{}
+		nums = append(nums, n)
+	}
+	sort.Ints(nums)
+	return nums, nil
+}
+
+func gitIsRepo(dir string) bool {
+	cmd := exec.Command("git", "-C", dir, "rev-parse", "--git-dir")
+	cmd.Stderr = nil
+	return cmd.Run() == nil
+}
+
+func batchGitCommitPush(dir, msg string) string {
+	if !gitIsRepo(dir) {
+		return "skipped (not a git repository)"
+	}
+
+	statusOut, err := exec.Command("git", "-C", dir, "status", "--porcelain").Output()
+	if err != nil {
+		return fmt.Sprintf("skipped (git status failed: %v)", err)
+	}
+	if len(bytes.TrimSpace(statusOut)) == 0 {
+		return "skipped (working tree clean)"
+	}
+
+	add := exec.Command("git", "-C", dir, "add", "-A")
+	add.Stderr = os.Stderr
+	if err := add.Run(); err != nil {
+		return fmt.Sprintf("failed (git add: %v)", err)
+	}
+
+	commit := exec.Command("git", "-C", dir, "commit", "-m", msg)
+	var commitErr bytes.Buffer
+	commit.Stderr = &commitErr
+	if err := commit.Run(); err != nil {
+		se := strings.ToLower(commitErr.String())
+		if strings.Contains(se, "nothing to commit") {
+			return "skipped (nothing to commit)"
+		}
+		return fmt.Sprintf("failed (git commit: %v — %s)", err, strings.TrimSpace(commitErr.String()))
+	}
+
+	push := exec.Command("git", "-C", dir, "push")
+	var pushErr bytes.Buffer
+	push.Stderr = &pushErr
+	if err := push.Run(); err != nil {
+		return fmt.Sprintf("failed (git push: %v — %s)", err, strings.TrimSpace(pushErr.String()))
+	}
+
+	return "ok (committed and pushed)"
+}
+
 func copyDirectory(source, destination string) error {
 	return filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -579,18 +896,6 @@ func tryReplaceInTextFile(path, oldValue, newValue string) {
 	_ = os.WriteFile(path, []byte(updated), 0o644)
 }
 
-func readPackageJSONVersion(packageJSONPath string) (string, error) {
-	data, err := os.ReadFile(packageJSONPath)
-	if err != nil {
-		return "", err
-	}
-	m := packageVersionPattern.FindStringSubmatch(string(data))
-	if len(m) < 2 {
-		return "", fmt.Errorf("could not find 'version' key")
-	}
-	return m[1], nil
-}
-
 func recentEditsFilePath() (string, error) {
 	cfg, err := os.UserConfigDir()
 	if err != nil {
@@ -662,35 +967,6 @@ func prependRecentEditPath(templatePath string) error {
 		return err
 	}
 	return os.WriteFile(filePath, []byte(strings.Join(merged, "\n")), 0o644)
-}
-
-func updatePackageJSONVersion(packageJSONPath, newVersion string) error {
-	data, err := os.ReadFile(packageJSONPath)
-	if err != nil {
-		return err
-	}
-	content := string(data)
-	re := regexp.MustCompile(`"version"\s*:\s*"[^"]*"`)
-	if !re.MatchString(content) {
-		return fmt.Errorf("could not find 'version' key")
-	}
-	updated := re.ReplaceAllString(content, fmt.Sprintf(`"version": "%s"`, newVersion))
-	return os.WriteFile(packageJSONPath, []byte(updated), 0o644)
-}
-
-func removeSamplesFromPackageJSON(packageJSONPath string) error {
-	data, err := os.ReadFile(packageJSONPath)
-	if err != nil {
-		return err
-	}
-	content := string(data)
-
-	re := regexp.MustCompile(`(,\s*"samples"\s*:\s*\[[\s\S]*?\])|("samples"\s*:\s*\[[\s\S]*?\]\s*,?)`)
-	updated := re.ReplaceAllString(content, "")
-	trailingCommaRe := regexp.MustCompile(`,\s*(\}|\])`)
-	updated = trailingCommaRe.ReplaceAllString(updated, `$1`)
-
-	return os.WriteFile(packageJSONPath, []byte(updated), 0o644)
 }
 
 func prependChangelogVersion(changelogPath, version, label string) error {
